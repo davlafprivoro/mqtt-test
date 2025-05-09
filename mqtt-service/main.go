@@ -1,52 +1,109 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
-	"os"
+	"io"
+	"log"
+	"net/http"
+	"strings"
+	"sync"
 
 	mqtt "github.com/eclipse/paho.mqtt.golang"
 )
 
 const (
-	broker               = "tcp://emqx:1883" // or tls://... for TLS
+	broker               = "tcp://emqx:1883"
 	clientID             = "go-backend"
 	username             = "your-username"
 	password             = "your-password"
 	commandTopicTemplate = "device/%s/command"
-	statusTopic          = "device/+/status" // subscribe to all devices
+	statusTopic          = "device/+/status"
 )
 
+var (
+	logsMu sync.Mutex
+	logs   []string
+)
+
+func appendLog(line string) {
+	logsMu.Lock()
+	defer logsMu.Unlock()
+	logs = append(logs, line)
+}
+
+func getLogs() string {
+	logsMu.Lock()
+	defer logsMu.Unlock()
+	return fmt.Sprintln("---- LOG START ----") +
+		fmt.Sprintln(strings.Join(logs, "\n"))
+}
+
 func main() {
-	opts := mqtt.NewClientOptions()
-	opts.AddBroker(broker)
-	opts.SetClientID(clientID)
-	opts.SetUsername(username)
-	opts.SetPassword(password)
-	opts.SetDefaultPublishHandler(func(client mqtt.Client, msg mqtt.Message) {
-		fmt.Printf("Received message: [%s] %s\n", msg.Topic(), string(msg.Payload()))
-	})
+	// 1) MQTT setup
+	opts := mqtt.NewClientOptions().
+		AddBroker(broker).
+		SetClientID(clientID).
+		SetUsername(username).
+		SetPassword(password).
+		SetDefaultPublishHandler(func(_ mqtt.Client, msg mqtt.Message) {
+			line := fmt.Sprintf("[STATUS] %s → %s",
+				msg.Topic(), string(msg.Payload()))
+			appendLog(line)
+		})
 
 	client := mqtt.NewClient(opts)
-	if token := client.Connect(); token.Wait() && token.Error() != nil {
-		fmt.Println("Error connecting:", token.Error())
-		os.Exit(1)
+	if tok := client.Connect(); tok.Wait() && tok.Error() != nil {
+		log.Fatalf("MQTT connect error: %v", tok.Error())
 	}
 	defer client.Disconnect(250)
+	appendLog("✅ Connected to MQTT broker")
 
-	// Subscribe to device status updates
-	if token := client.Subscribe(statusTopic, 1, nil); token.Wait() && token.Error() != nil {
-		fmt.Println("Subscription error:", token.Error())
+	// Subscribe to status
+	if tok := client.Subscribe(statusTopic, 1, nil); tok.Wait() && tok.Error() != nil {
+		log.Fatalf("MQTT subscribe error: %v", tok.Error())
 	}
+	appendLog("✅ Subscribed to status topic")
 
-	// Send command to device with ID "android123"
-	deviceID := "android123"
-	commandTopic := fmt.Sprintf(commandTopicTemplate, deviceID)
-	command := "TURN_ON"
+	// 2) HTTP handlers
+	http.HandleFunc("/send", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "only POST", http.StatusMethodNotAllowed)
+			return
+		}
+		var req struct {
+			DeviceID string `json:"deviceID"`
+			Command  string `json:"command"`
+		}
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, "read error", 400)
+			return
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			http.Error(w, "bad json", 400)
+			return
+		}
+		topic := fmt.Sprintf(commandTopicTemplate, req.DeviceID)
+		appendLog(fmt.Sprintf("[PUBLISH] %s ← %s", topic, req.Command))
+		tok := client.Publish(topic, 1, false, req.Command)
+		tok.Wait()
+		if err := tok.Error(); err != nil {
+			appendLog(fmt.Sprintf("❌ publish error: %v", err))
+		}
+		w.WriteHeader(204)
+	})
 
-	fmt.Printf("Sending command to %s: %s\n", commandTopic, command)
-	token := client.Publish(commandTopic, 1, false, command)
-	token.Wait()
+	http.HandleFunc("/logs", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+		fmt.Fprint(w, getLogs())
+	})
 
-	// Keep app running to receive messages
-	select {}
+	// 3) Serve index.html as well
+	fs := http.FileServer(http.Dir("."))
+	http.Handle("/", fs)
+
+	port := "8080"
+	appendLog("🔌 HTTP server listening on :" + port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
