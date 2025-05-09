@@ -1,0 +1,29 @@
+services:
+
+  emqx:
+    image: emqx:latest
+    ports:
+      - "18083:18083" # dashboard
+      - "1883:1883"   # mqtt
+    environment:
+      EMQX_DASHBOARD__DEFAULT_USERNAME: admin
+      EMQX_DASHBOARD__DEFAULT_PASSWORD: public
+    healthcheck:
+      test: ["CMD", "/opt/emqx/bin/emqx_ctl", "status"]
+      interval: 2s
+      timeout: 5s
+      retries: 3
+
+  fake-device:
+    build:
+      context: ./fake-device
+    depends_on:
+      emqx:
+        condition: service_healthy
+      
+  mqtt-test:
+    build:
+      context: ./mqtt-service
+    depends_on:
+      fake-device:
+        condition: service_started
